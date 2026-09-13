@@ -203,13 +203,4 @@ any repo configuration.
   the existing per-domain concurrency bound, which already keeps the
   agent from hammering any single site.
 
-## Repository / submission notes
 
-- **Operations question (40% manual ops expectation):** this is a
-  confirmation about your own working expectations for the role, not
-  something the code or I can answer on your behalf — you'll want to
-  respond to that directly in your submission.
-- **Loom walkthrough:** I can't record video, but I'm happy to put
-  together short talking points / a suggested script covering code
-  structure → running it in the terminal → the resulting output, if
-  that would help you plan the recording.
