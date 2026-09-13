@@ -70,6 +70,7 @@ class DomainRunResult(BaseModel):
     pages_fetched: list[str] = Field(default_factory=list)
     pages_failed: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    tool_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0

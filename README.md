@@ -1,22 +1,33 @@
 # Autonomous Lead Enrichment Agent
 
-Takes a list of company domains, crawls their public web presence with a
-headless browser, reduces the result to clean text, and extracts
-structured company intelligence with Claude's tool-calling (strict
-JSON schema, not "please return JSON").
+Takes a list of company domains and, for each one, runs an autonomous
+Claude agent that explores the company's public website — deciding for
+itself which pages are worth reading — and ends by submitting a
+structured company intelligence record via a strict tool schema.
 
 ```
-domains --> [browser.py]        headless fetch, retries, timeouts
-        --> [link_discovery.py] find /about /team /pricing etc.
-        --> [content_cleaner.py] strip scripts/nav/svg -> plain text, capped
-        --> [llm_extractor.py]  Claude tool-call -> CompanyIntelligence
-        --> [search_fallback.py] (optional) resolve missing LinkedIn URLs
-        --> output.json
+                    ┌──────────────────────────────────────────┐
+                    │              agent.py (per domain)         │
+domain ──────────►  │  loop: Claude picks a tool each turn        │  ──► DomainRunResult
+                    │   • visit_page   → browser.py + content_    │
+                    │                    cleaner.py + link_        │
+                    │                    discovery.py (fetch,      │
+                    │                    strip, rank links)        │
+                    │   • search_web   → tools.py (Tavily, optional)│
+                    │   • submit_intelligence → schemas.py          │
+                    │                    (validated, self-repairs   │
+                    │                    on failure)                │
+                    └──────────────────────────────────────────┘
+                                       │
+                    pipeline.py fans this out across all input
+                    domains concurrently (bounded by DOMAIN_CONCURRENCY)
 ```
 
-Every stage in `pipeline.py` is wrapped so **one bad domain never kills
-the batch** — a timeout, 404, or bot-block just gets logged into that
-domain's `errors` list and the run continues.
+This is deliberately **not** a fixed "fetch homepage → grep for /about →
+one LLM call" pipeline. Claude gets three tools and a step budget, and
+decides turn-by-turn where to look — the same way a human researcher
+would click through a site rather than following a hard-coded list of
+paths.
 
 ## Setup
 
@@ -24,14 +35,16 @@ domain's `errors` list and the run continues.
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium        # downloads the headless browser binary
+playwright install chromium         # downloads the headless browser binary
 
 cp .env.example .env
 # then edit .env and set ANTHROPIC_API_KEY (required)
 ```
 
-`TAVILY_API_KEY` in `.env` is optional — it powers the bonus LinkedIn
-search fallback. Leave it blank to skip that step entirely.
+`TAVILY_API_KEY` in `.env` is optional — it powers the `search_web` tool
+the agent can use to resolve a founder's LinkedIn URL when it's not on
+the company's own site. Leave it blank and the agent is simply told
+that tool is unavailable and proceeds without it.
 
 ## Run
 
@@ -39,14 +52,21 @@ search fallback. Leave it blank to skip that step entirely.
 python main.py --domains postman.com supabase.com vapi.ai --output output.json
 ```
 
-or from a file (one domain per line):
-
 ```bash
-python main.py --input-file domains.txt --output output.json
+python main.py --input-file domains.txt --output output.json --concurrency 5
 ```
 
-This prints a per-domain token/cost summary to the terminal and writes
-a JSON array to `output.json`, one record per input domain:
+or with Docker (no local Python/Playwright setup needed):
+
+```bash
+docker build -t lead-enrichment-agent .
+docker run --rm -e ANTHROPIC_API_KEY=sk-ant-... \
+  -v "$(pwd)/output:/app/output" \
+  lead-enrichment-agent --domains postman.com supabase.com vapi.ai --output /app/output/output.json
+```
+
+Each run prints a per-domain token/cost table and writes a JSON array,
+one record per input domain:
 
 ```json
 {
@@ -60,69 +80,108 @@ a JSON array to `output.json`, one record per input domain:
   },
   "pages_fetched": ["..."],
   "pages_failed": ["..."],
+  "tool_calls": 3,
   "errors": [],
-  "tokens": {"input": 1234, "output": 210},
-  "elapsed_seconds": 4.2
+  "tokens": {"input": 3120, "output": 480}
 }
 ```
 
+## Architecture
+
+| Module | Responsibility |
+|---|---|
+| `src/agent.py` | The per-domain tool-calling loop: calls Claude, executes whatever tools it asks for, self-repairs invalid submissions, forces a final answer if the step budget runs out. |
+| `src/tools.py` | The three tool schemas (`visit_page`, `search_web`, `submit_intelligence`) and their execution logic. |
+| `src/browser.py` | Playwright fetch with retries, UA rotation, stealth patching, classified errors (`blocked`/`not_found`/`timeout`/`server_error`), and a disk-cache check. Exposed behind a `PageFetcher` protocol so tests never need a real browser. |
+| `src/content_cleaner.py` | Strips scripts/styles/svg/nav/footer and hard-caps text length — raw HTML never reaches the model. |
+| `src/link_discovery.py` | Extracts same-domain links with anchor text, ranked (not filtered) by keyword relevance, for the agent to reason over. |
+| `src/llm_client.py` | Async Anthropic client wrapper with retry/backoff on rate limits (honors `Retry-After`) and transient 5xxs. Exposed behind an `LLMClient` protocol for testability. |
+| `src/cache.py` | Disk cache for fetched pages, keyed by URL hash — cost/latency optimization only, safe to delete. |
+| `src/pipeline.py` | Fans the agent out across all input domains concurrently, bounded by `DOMAIN_CONCURRENCY`; one domain's unhandled exception never affects the rest. |
+| `src/cost_tracker.py` | Token usage → estimated USD cost, printed as a summary table. |
+| `src/schemas.py` | The Pydantic models — `CompanyIntelligence` doubles as the `submit_intelligence` tool's JSON Schema. |
+
 ## Design decisions
 
-- **Structured output via tool-calling, not prompted JSON.** `schemas.py`
-  defines `CompanyIntelligence` as a Pydantic model; `llm_extractor.py`
-  converts it to a JSON Schema and passes it as a forced tool
-  (`tool_choice={"type": "tool", ...}`). The response is guaranteed to
-  match the schema shape, so there's no regex-parsing a code fence out
-  of free text.
+- **A real agentic loop, not a scripted pipeline.** The model itself
+  decides which pages to visit (via `visit_page`) and when it has
+  enough to stop (via `submit_intelligence`). A site that calls its
+  team page "The Humans of Acme" instead of `/about` still gets found,
+  because the agent is reasoning over link text, not matching a fixed
+  keyword list. Multiple tool calls requested in the same turn (e.g.
+  "visit /about and /pricing at once") run concurrently.
+- **Structured output via forced tool-calling**, not prompted JSON —
+  `CompanyIntelligence`'s Pydantic schema *is* the `submit_intelligence`
+  tool's `input_schema`, so a response is guaranteed to match the shape.
+- **Self-repair on bad submissions.** If `submit_intelligence`'s
+  arguments fail Pydantic validation, that's returned to the model as a
+  normal tool error (`is_error: true`) with the validation message —
+  the same mechanism as any other failed tool call — and the model gets
+  a chance to resubmit corrected data in the same run, rather than the
+  domain just failing.
 - **Token optimization happens before the LLM ever sees anything.**
   `content_cleaner.py` strips `<script>`, `<style>`, `<svg>`, nav/footer
-  landmarks, and `aria-hidden` elements, then hard-caps each page to
-  `MAX_CHARS_PER_PAGE` and the combined context to `MAX_CHARS_TOTAL`.
-  Raw HTML is never sent to the model.
-- **Link discovery is keyword-ranked, not a generic crawler.** For lead
-  enrichment we want ~5 high-signal pages (about/team/pricing/contact),
-  not a full site mirror — that keeps both latency and token spend
-  bounded per domain regardless of how large the target site is.
-- **Resilience is layered, not bolted on.** `browser.py`'s `fetch_page`
-  retries with backoff and treats timeouts/404s/bot-blocks (403/429) as
-  soft failures returning `FetchResult(html=None, error=...)`.
-  `pipeline.py` degrades further: if the homepage is entirely
-  unreachable, it still emits a `CompanyIntelligence` record with
-  `data_confidence_score=0.0` rather than raising, so every input domain
-  is guaranteed a row in `output.json`.
-- **Cost tracking** (`cost_tracker.py`) reads `response.usage` off every
-  Claude call and prints a per-domain input/output token table with an
-  estimated USD cost at the end of a run. The per-token prices in
-  `.env.example` are approximate — check
-  [anthropic.com/pricing](https://www.anthropic.com/pricing) for current
-  rates before treating the total as more than directional.
-- **Bonus: LinkedIn search fallback.** If a founder/leader is extracted
-  without a `linkedin_url`, `search_fallback.py` optionally queries
-  [Tavily](https://tavily.com) (a search API built for LLM pipelines) for
-  `"{name} {company} linkedin"` and takes the first `linkedin.com/in/...`
-  hit. Skipped cleanly if `TAVILY_API_KEY` isn't set.
+  landmarks, and `aria-hidden` elements, then hard-caps each page's text.
+- **Layered resilience.** `browser.py` retries with backoff and
+  classifies failures (`blocked`, `not_found`, `timeout`,
+  `server_error`) instead of one generic error string. `agent.py`
+  treats an LLM outage, a bad tool call, or an exhausted step budget as
+  recoverable — the run always ends with *some* `CompanyIntelligence`
+  record, even in the worst case (`data_confidence_score: 0.0` with the
+  reason in `errors`). `pipeline.py` adds a second safety net around
+  each domain's agent run for the batch as a whole.
+- **Rate-limit aware.** `llm_client.py` catches `RateLimitError`
+  specifically, honors the API's `Retry-After` header when present, and
+  backs off exponentially on transient 5xxs — separate from the
+  browser-level retry logic, since these are different failure modes.
+- **Anti-bot resilience without pretending to be something else.**
+  User-agent rotation and `playwright-stealth` patch the generic
+  headless-browser fingerprints that some WAFs block by default — this
+  is about not getting false-positived for automating a normal page
+  load of public marketing content, not about evading access controls
+  on non-public data. There's no CAPTCHA-solving or proxy rotation here.
+- **Disk cache** (`src/cache.py`) keyed by URL hash so re-running the
+  same domain during development doesn't re-pay for the same fetch.
+  Purely a cost/latency optimization — delete `.cache/` any time.
+- **Cost tracking** reads `response.usage` off every Claude call
+  (accumulated across all turns in a domain's agent run, including the
+  forced-finalization call if one happens) and prints a per-domain
+  input/output token table with an estimated USD cost. The per-token
+  prices in `.env.example` are approximate — check
+  [anthropic.com/pricing](https://www.anthropic.com/pricing) for
+  current rates.
+- **Bonus: search as an agent tool, not a bolted-on post-step.** Rather
+  than always running a fixed "look up LinkedIn for anyone missing one"
+  pass after extraction, `search_web` is just another tool the agent
+  can reach for mid-run, when *it* decides a name is worth looking up.
+  Skipped cleanly (with a clear message back to the model) if
+  `TAVILY_API_KEY` isn't set.
 
 ## Sample output
 
 `sample_output/output.json` holds real, verified data for the three
 test domains (postman.com, supabase.com, vapi.ai) — company overview,
 target audience, leadership, and contact info were all pulled from each
-site's actual live content.
+site's actual live content, including a genuine `search_web`-style
+resolution of Vapi CEO Jordan Dearsley's LinkedIn URL (marked
+`"source": "search"`).
 
 **One caveat on how it was produced:** the sandboxed environment used to
 assemble this submission has network egress restricted to package
 registries (pip/npm) and github.com — it can't reach postman.com,
 supabase.com, or vapi.ai directly, and had no `ANTHROPIC_API_KEY`
 available to call the live API. So this specific file was built by
-fetching each site's real content through a research tool and applying
-the exact same extraction logic and schema by hand (each record's
-`errors` field says so explicitly). Every function used to get there —
-`content_cleaner.clean_html_to_text`, `link_discovery.discover_subpages`,
-`extract_emails`, and the `CompanyIntelligence` schema itself — is
-exercised by the unit tests in `tests/`, and running
+researching each site's real content through a separate tool and
+applying the same extraction logic and schema by hand (each record's
+`errors` field says so explicitly). Every function actually exercised
+in getting there — `content_cleaner.clean_html_to_text`,
+`link_discovery.extract_links`, `extract_emails`, the
+`CompanyIntelligence` schema, and the full agent control-flow loop
+(happy path, off-domain rejection, self-repair, budget exhaustion, LLM
+outage) — is covered by the tests in `tests/`, and running
 `python main.py --domains postman.com supabase.com vapi.ai` on a machine
 with normal internet access and a real API key reproduces this same
-output end-to-end through the actual Playwright + Claude pipeline.
+output end-to-end through the actual agent.
 
 ## Testing
 
@@ -130,23 +189,34 @@ output end-to-end through the actual Playwright + Claude pipeline.
 pytest tests/ -v
 ```
 
-Covers the pure-function logic (HTML cleaning, email extraction, link
-ranking) that doesn't require network access or an API key, so it runs
-in any environment including CI.
+- `tests/test_content_cleaner.py` — pure-function coverage of HTML
+  cleaning, email extraction, and link ranking.
+- `tests/test_agent.py` — the agent's control-flow loop, using a fake
+  `PageFetcher` and a scripted fake `LLMClient` (no network, no API key,
+  no real browser needed): a normal multi-step research run, an
+  off-domain `visit_page` rejection, self-repair after an invalid
+  `submit_intelligence` call, forced finalization when the step budget
+  runs out (plus same-URL caching within a run), and survival of a
+  simulated total LLM outage.
+
+CI (`.github/workflows/ci.yml`) runs this same suite on every push —
+no secrets or live network access required, so it stays green without
+any repo configuration.
 
 ## Known limitations
 
-- Sites that gate all content behind a login or aggressive bot
-  protection (Cloudflare interstitials, etc.) will show up as
-  `pages_failed` with `HTTP 403` — there's no CAPTCHA-solving or proxy
-  rotation here.
-- The search fallback returns the first LinkedIn-shaped URL from search
+- No CAPTCHA-solving or proxy rotation — a site behind an aggressive
+  challenge page will show up in `pages_failed` with `error_type:
+  "blocked"`.
+- `search_web` returns the first LinkedIn-shaped URL from search
   results; for very common names this can occasionally attribute the
-  wrong profile. It's a best-effort bonus feature, not verified identity
-  resolution.
-- `data_confidence_score` is the model's own self-assessment given the
-  retrieved text — it's a heuristic signal for triage, not a calibrated
-  probability.
+  wrong profile. Best-effort, not verified identity resolution.
+- `data_confidence_score` is the model's own self-assessment given what
+  it actually retrieved — a heuristic signal for triage, not a
+  calibrated probability.
+- No `robots.txt` checking yet — a reasonable next addition alongside
+  the existing per-domain concurrency bound, which already keeps the
+  agent from hammering any single site.
 
 ## Repository / submission notes
 

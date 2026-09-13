@@ -3,23 +3,36 @@
 Uses Playwright (Chromium) so JS-rendered marketing sites (Next.js,
 client-side React, etc.) come back with fully hydrated DOM instead of
 an empty shell. Every call here is wrapped so a single bad page
-(timeout, 404, bot block) returns `None` plus a reason instead of
-raising — the pipeline layer is responsible for deciding what to do
-with a miss, this layer just reports it.
+(timeout, 404, bot block) returns a `FetchResult` with `html=None` and
+a classified `error_type` instead of raising — callers decide what to
+do with a miss, this layer just reports it precisely.
+
+`PlaywrightFetcher` wraps a live `Browser` behind the `PageFetcher`
+protocol so the rest of the codebase (and tests) depend on "something
+that can fetch a URL", not on Playwright directly — a fake fetcher in
+tests can simulate any mix of successes/timeouts/blocks without ever
+launching a real browser.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 from playwright.async_api import Browser, TimeoutError as PWTimeoutError, async_playwright
 
+from src import cache
 from src.config import settings
 
 logger = logging.getLogger(__name__)
+
+try:
+    from playwright_stealth import stealth_async
+except ImportError:  # optional dependency — degrade to no stealth patching
+    stealth_async = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -28,10 +41,19 @@ class FetchResult:
     html: Optional[str]
     status: Optional[int]
     error: Optional[str] = None
+    error_type: Optional[str] = None  # "blocked" | "not_found" | "server_error" | "timeout" | "network" | None
+    from_cache: bool = False
 
     @property
     def ok(self) -> bool:
         return self.html is not None
+
+
+class PageFetcher(Protocol):
+    """Anything that can fetch a URL and return a FetchResult. Implemented
+    by PlaywrightFetcher for real use and by fakes in tests."""
+
+    async def fetch(self, url: str) -> FetchResult: ...
 
 
 async def fetch_page(browser: Browser, url: str) -> FetchResult:
@@ -39,39 +61,58 @@ async def fetch_page(browser: Browser, url: str) -> FetchResult:
 
     Never raises. Bot blockers (403/429), 404s, DNS failures, and
     navigation timeouts all fall through to a FetchResult with
-    html=None and a human-readable `error`, so the caller can log it
-    and move on to the next page/domain without the whole run dying.
+    html=None and a classified error, so the caller can log it and move
+    on without the whole run dying.
     """
+    cached_html = cache.get(url)
+    if cached_html is not None:
+        return FetchResult(url=url, html=cached_html, status=200, from_cache=True)
+
     last_error = "unknown error"
+    last_error_type: Optional[str] = "network"
     for attempt in range(1, settings.nav_retries + 2):  # +1 initial try
         context = None
         try:
-            context = await browser.new_context(user_agent=settings.user_agent)
+            ua = random.choice(settings.user_agent_pool)
+            context = await browser.new_context(user_agent=ua)
             page = await context.new_page()
+            if stealth_async is not None:
+                try:
+                    await stealth_async(page)
+                except Exception:  # noqa: BLE001 - stealth patching must never break a fetch
+                    pass
+
             response = await page.goto(
                 url, timeout=settings.page_timeout_ms, wait_until="domcontentloaded"
             )
-            # Give client-side rendered content a brief moment to settle.
             try:
                 await page.wait_for_load_state("networkidle", timeout=3000)
             except PWTimeoutError:
-                pass  # Not fatal — some sites never go fully idle (analytics beacons etc.)
+                pass  # not fatal — some sites never go fully idle (analytics beacons etc.)
 
             status = response.status if response else None
             if status and status >= 400:
-                last_error = f"HTTP {status}"
                 if status in (403, 429):
-                    # Likely a bot blocker — retrying won't help, fail fast for this URL.
-                    return FetchResult(url=url, html=None, status=status, error=last_error)
-                # Other 4xx/5xx: fall through to retry loop below.
+                    last_error, last_error_type = f"HTTP {status} (likely bot-blocked)", "blocked"
+                    return FetchResult(url=url, html=None, status=status, error=last_error, error_type=last_error_type)
+                if status == 404:
+                    last_error, last_error_type = "HTTP 404", "not_found"
+                    return FetchResult(url=url, html=None, status=status, error=last_error, error_type=last_error_type)
+                if status >= 500:
+                    last_error, last_error_type = f"HTTP {status}", "server_error"
+                    # worth retrying — fall through to the retry loop below
+                else:
+                    last_error, last_error_type = f"HTTP {status}", "other"
+                    return FetchResult(url=url, html=None, status=status, error=last_error, error_type=last_error_type)
             else:
                 html = await page.content()
+                cache.set(url, html)
                 return FetchResult(url=url, html=html, status=status)
 
         except PWTimeoutError:
-            last_error = "navigation timeout"
+            last_error, last_error_type = "navigation timeout", "timeout"
         except Exception as exc:  # noqa: BLE001 - deliberately broad, this must never crash the run
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error, last_error_type = f"{type(exc).__name__}: {exc}", "network"
         finally:
             if context is not None:
                 await context.close()
@@ -80,18 +121,17 @@ async def fetch_page(browser: Browser, url: str) -> FetchResult:
             await asyncio.sleep(1.5 * attempt)  # simple backoff
 
     logger.warning("giving up on %s after retries: %s", url, last_error)
-    return FetchResult(url=url, html=None, status=None, error=last_error)
+    return FetchResult(url=url, html=None, status=None, error=last_error, error_type=last_error_type)
 
 
-async def fetch_many(browser: Browser, urls: list[str]) -> list[FetchResult]:
-    """Fetch several URLs concurrently, capped by settings.concurrent_pages."""
-    semaphore = asyncio.Semaphore(settings.concurrent_pages)
+class PlaywrightFetcher:
+    """Concrete PageFetcher backed by a live Playwright Browser."""
 
-    async def _bounded(u: str) -> FetchResult:
-        async with semaphore:
-            return await fetch_page(browser, u)
+    def __init__(self, browser: Browser) -> None:
+        self._browser = browser
 
-    return await asyncio.gather(*(_bounded(u) for u in urls))
+    async def fetch(self, url: str) -> FetchResult:
+        return await fetch_page(self._browser, url)
 
 
 class BrowserSession:

@@ -3,7 +3,7 @@
 
 Usage:
     python main.py --domains postman.com supabase.com vapi.ai
-    python main.py --input-file domains.txt --output out.json
+    python main.py --input-file domains.txt --output out.json --concurrency 5
 """
 
 from __future__ import annotations
@@ -15,12 +15,11 @@ import logging
 import sys
 import time
 
-from anthropic import Anthropic
-
-from src.browser import BrowserSession
+from src.browser import BrowserSession, PlaywrightFetcher
 from src.config import settings
 from src.cost_tracker import summarize
-from src.pipeline import domain_cost, process_domain
+from src.llm_client import AnthropicLLMClient
+from src.pipeline import domain_cost, run_batch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output", default="output.json", help="Where to write the resulting JSON array."
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Max domains processed at once (overrides DOMAIN_CONCURRENCY from .env).",
+    )
     return parser.parse_args()
 
 
@@ -51,13 +56,12 @@ def load_domains(args: argparse.Namespace) -> list[str]:
         with open(args.input_file, encoding="utf-8") as f:
             domains.extend(line.strip() for line in f if line.strip())
     if not domains:
-        parser_error = "Provide domains via --domains or --input-file."
-        print(parser_error, file=sys.stderr)
+        print("Provide domains via --domains or --input-file.", file=sys.stderr)
         sys.exit(1)
     return domains
 
 
-async def run(domains: list[str]) -> list[dict]:
+async def run(domains: list[str], concurrency: int | None) -> list[dict]:
     if not settings.anthropic_api_key:
         print(
             "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill it in.",
@@ -65,52 +69,52 @@ async def run(domains: list[str]) -> list[dict]:
         )
         sys.exit(1)
 
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    records: list[dict] = []
-    costs = []
+    if concurrency is not None:
+        # Settings is a frozen dataclass; this is the one sanctioned override
+        # point for a CLI flag beating the .env default for a single run.
+        object.__setattr__(settings, "domain_concurrency", concurrency)
+
+    llm = AnthropicLLMClient(api_key=settings.anthropic_api_key)
+    start_times: dict[str, float] = {}
 
     async with BrowserSession() as session:
-        for domain in domains:
-            logger.info("processing %s", domain)
-            start = time.monotonic()
-            try:
-                result = await process_domain(session.browser, client, domain)
-            except Exception as exc:  # noqa: BLE001 - absolute last line of defense
-                logger.error("unhandled error processing %s: %s", domain, exc)
-                result = None
+        fetcher = PlaywrightFetcher(session.browser)
+        start = time.monotonic()
+        for d in domains:
+            start_times[d] = start
+        logger.info("processing %d domain(s) with concurrency=%d", len(domains), settings.domain_concurrency)
+        results_by_domain = await run_batch(fetcher, llm, domains)
+        elapsed_total = time.monotonic() - start
 
-            elapsed = time.monotonic() - start
-            if result is None:
-                records.append(
-                    {
-                        "domain": domain,
-                        "intelligence": None,
-                        "errors": [f"unhandled pipeline error"],
-                        "elapsed_seconds": round(elapsed, 2),
-                    }
-                )
-                continue
+    records: list[dict] = []
+    costs = []
+    for domain in domains:  # preserve input order in the output
+        result = results_by_domain.get(domain)
+        if result is None:
+            records.append({"domain": domain, "intelligence": None, "errors": ["no result produced"]})
+            continue
 
-            costs.append(domain_cost(domain, result))
-            records.append(
-                {
-                    "domain": domain,
-                    "intelligence": result.intelligence.model_dump() if result.intelligence else None,
-                    "pages_fetched": result.pages_fetched,
-                    "pages_failed": result.pages_failed,
-                    "errors": result.errors,
-                    "tokens": {"input": result.input_tokens, "output": result.output_tokens},
-                    "elapsed_seconds": round(elapsed, 2),
-                }
-            )
-            logger.info(
-                "done %s in %.1fs (%d pages ok, %d failed)",
-                domain,
-                elapsed,
-                len(result.pages_fetched),
-                len(result.pages_failed),
-            )
+        costs.append(domain_cost(domain, result))
+        records.append(
+            {
+                "domain": domain,
+                "intelligence": result.intelligence.model_dump() if result.intelligence else None,
+                "pages_fetched": result.pages_fetched,
+                "pages_failed": result.pages_failed,
+                "tool_calls": result.tool_calls,
+                "errors": result.errors,
+                "tokens": {"input": result.input_tokens, "output": result.output_tokens},
+            }
+        )
+        logger.info(
+            "done %s (%d pages ok, %d failed, %d tool calls)",
+            domain,
+            len(result.pages_fetched),
+            len(result.pages_failed),
+            result.tool_calls,
+        )
 
+    logger.info("batch finished in %.1fs", elapsed_total)
     if costs:
         print("\n" + summarize(costs) + "\n")
     return records
@@ -119,7 +123,7 @@ async def run(domains: list[str]) -> list[dict]:
 def main() -> None:
     args = parse_args()
     domains = load_domains(args)
-    records = asyncio.run(run(domains))
+    records = asyncio.run(run(domains, args.concurrency))
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
