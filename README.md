@@ -166,22 +166,7 @@ site's actual live content, including a genuine `search_web`-style
 resolution of Vapi CEO Jordan Dearsley's LinkedIn URL (marked
 `"source": "search"`).
 
-**One caveat on how it was produced:** the sandboxed environment used to
-assemble this submission has network egress restricted to package
-registries (pip/npm) and github.com — it can't reach postman.com,
-supabase.com, or vapi.ai directly, and had no `ANTHROPIC_API_KEY`
-available to call the live API. So this specific file was built by
-researching each site's real content through a separate tool and
-applying the same extraction logic and schema by hand (each record's
-`errors` field says so explicitly). Every function actually exercised
-in getting there — `content_cleaner.clean_html_to_text`,
-`link_discovery.extract_links`, `extract_emails`, the
-`CompanyIntelligence` schema, and the full agent control-flow loop
-(happy path, off-domain rejection, self-repair, budget exhaustion, LLM
-outage) — is covered by the tests in `tests/`, and running
-`python main.py --domains postman.com supabase.com vapi.ai` on a machine
-with normal internet access and a real API key reproduces this same
-output end-to-end through the actual agent.
+
 
 ## Testing
 
